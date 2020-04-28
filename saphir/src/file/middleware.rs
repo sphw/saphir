@@ -1,11 +1,10 @@
 use crate::{
     file::{
-        cache::FileCache,
         conditional_request::{format_systemtime, is_fresh, is_precondition_failed},
         etag::{EntityTag, SystemTimeExt},
         range::Range,
         range_requests::{extract_range, is_range_fresh, is_satisfiable_range},
-        Compression,
+        FileInfo, FileStream,
     },
     prelude::*,
 };
@@ -18,13 +17,9 @@ use std::{
     time::SystemTime,
 };
 
-const CACHE_MAX_FILE_SIZE: u64 = 2_147_483_648;
-const CACHE_MAX_CAPACITY: u64 = 8_589_934_592;
-
 pub struct FileMiddleware {
     base_path: PathBuf,
     www_path: PathBuf,
-    cache: FileCache,
 }
 
 impl FileMiddleware {
@@ -32,13 +27,11 @@ impl FileMiddleware {
         FileMiddleware {
             base_path: PathBuf::from(base_path.to_string()),
             www_path: PathBuf::from(www_path.to_string()),
-            cache: FileCache::new(CACHE_MAX_FILE_SIZE, CACHE_MAX_CAPACITY),
         }
     }
 
     async fn next_inner(&self, mut ctx: HttpContext, _chain: &dyn MiddlewareChain) -> Result<HttpContext, SaphirError> {
         let mut builder = Builder::new();
-        let mut cache = self.cache.clone();
         let req = ctx.state.request_unchecked();
         let path = match self.file_path_from_path(req.uri().path()) {
             Ok(path) => path,
@@ -77,14 +70,6 @@ impl FileMiddleware {
 
         let mut is_partial_content = false;
 
-        let compression = req
-            .headers()
-            .get(header::ACCEPT_ENCODING)
-            .and_then(|header| header.to_str().ok())
-            .map(|str| str.split(',').map(|encoding| Compression::from_str(encoding.trim()).unwrap_or_default()).max())
-            .flatten()
-            .unwrap_or_default();
-
         if let Some(range) = req
             .headers()
             .get(header::RANGE)
@@ -94,8 +79,10 @@ impl FileMiddleware {
             match (is_range_fresh(&req, &etag, &last_modified), is_satisfiable_range(&range, size as u64)) {
                 (true, Some(content_range)) => {
                     if let Some(range) = extract_range(&content_range) {
-                        let file = cache.open_file_with_range(&path, range).await?;
+                        let file = File::open(path.to_str().unwrap_or("")).await?;
                         size = file.get_size();
+                        let mut file: FileStream = file.into();
+                        file.set_range(range).await?;
                         builder = builder.file(file).map_err(|error| error.1)?;
                     }
                     builder = builder
@@ -108,13 +95,9 @@ impl FileMiddleware {
         }
 
         if !is_partial_content {
-            let file = cache.open_file(&path, compression).await?;
+            let file = File::open(path.to_str().unwrap_or("")).await?;
             size = file.get_size();
-            builder = builder.file(file).map_err(|(_, e)| e)?;
-        }
-
-        if compression != Compression::Raw {
-            builder = builder.header(header::CONTENT_ENCODING, compression.to_string())
+            builder = builder.file(file.into()).map_err(|(_, e)| e)?;
         }
 
         builder = builder
@@ -201,10 +184,6 @@ impl FileMiddlewareBuilder {
         Ok(FileMiddleware {
             base_path: self.base_path,
             www_path: self.www_path,
-            cache: FileCache::new(
-                self.max_file_size.unwrap_or(CACHE_MAX_FILE_SIZE),
-                self.max_capacity.unwrap_or(CACHE_MAX_CAPACITY),
-            ),
         })
     }
 }

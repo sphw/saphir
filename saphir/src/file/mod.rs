@@ -13,14 +13,9 @@ use tokio::{
     prelude::*,
 };
 
-use crate::{error::SaphirError, file::middleware::PathExt, http_context::HttpContext, responder::Responder, response::Builder};
-use flate2::write::{DeflateEncoder, GzEncoder};
-use futures::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, Cursor};
-use mime::Mime;
-use nom::lib::std::str::FromStr;
-use std::io::Write;
+use crate::{file::middleware::PathExt, http_context::HttpContext, responder::Responder, response::Builder};
+use futures::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
 
-mod cache;
 mod conditional_request;
 mod content_range;
 mod etag;
@@ -109,165 +104,34 @@ impl AsyncSeek for File {
     }
 }
 
-pub struct FileCursor {
-    inner: Pin<Box<Cursor<Vec<u8>>>>,
-    mime: Option<Mime>,
-    path: PathBuf,
-    size: u64,
-}
+impl Responder for File {
+    fn respond_with_builder(self, builder: Builder, _ctx: &HttpContext) -> Builder {
+        let mime = if let Some(mime) = &self.get_mime() {
+            mime.as_ref().to_string()
+        } else {
+            self.get_path()
+                .mime()
+                .unwrap_or_else(|| {
+                    if self.get_path().is_dir() {
+                        mime::TEXT_HTML_UTF_8
+                    } else {
+                        mime::TEXT_PLAIN_UTF_8
+                    }
+                })
+                .as_ref()
+                .to_string()
+        };
 
-impl FileCursor {
-    pub fn new(inner: Vec<u8>, mime: Option<Mime>, path: PathBuf) -> Self {
-        let size = inner.len() as u64;
-        FileCursor {
-            inner: Box::pin(Cursor::new(inner)),
-            mime,
-            path,
-            size,
-        }
-    }
-}
+        let len = self.get_size();
 
-impl FileInfo for FileCursor {
-    fn get_path(&self) -> &PathBuf {
-        &self.path
-    }
+        let b = match builder.file(self.into()) {
+            Ok(b) => b,
+            Err((b, _e)) => b.status(500).body("Unable to read file"),
+        };
 
-    fn get_mime(&self) -> Option<&Mime> {
-        self.mime.as_ref()
-    }
-
-    fn get_size(&self) -> u64 {
-        self.size
-    }
-}
-
-impl AsyncRead for FileCursor {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().poll_read(cx, buf)
-    }
-}
-
-impl AsyncSeek for FileCursor {
-    fn poll_seek(mut self: Pin<&mut Self>, cx: &mut Context<'_>, pos: SeekFrom) -> Poll<io::Result<u64>> {
-        self.inner.as_mut().poll_seek(cx, pos)
-    }
-}
-
-#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Debug)]
-pub enum Compression {
-    Raw,
-    Deflate,
-    Gzip,
-    Brotli,
-}
-
-impl Default for Compression {
-    fn default() -> Self {
-        Compression::Raw
-    }
-}
-
-impl FromStr for Compression {
-    type Err = SaphirError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "deflate" => Ok(Compression::Deflate),
-            "gzip" => Ok(Compression::Gzip),
-            "br" => Ok(Compression::Brotli),
-            _ => Err(SaphirError::Other("Encoding not supported".to_string())),
-        }
-    }
-}
-
-impl ToString for Compression {
-    fn to_string(&self) -> String {
-        match self {
-            Compression::Deflate => "deflate".to_string(),
-            Compression::Gzip => "gzip".to_string(),
-            Compression::Brotli => "br".to_string(),
-            _ => "".to_string(),
-        }
-    }
-}
-
-pub enum Encoder {
-    Brotli(brotli::CompressorWriter<Vec<u8>>),
-    Gzip(GzEncoder<Vec<u8>>),
-    Deflate(DeflateEncoder<Vec<u8>>),
-    None,
-}
-
-impl Encoder {
-    pub fn is_none(&self) -> bool {
-        match self {
-            Encoder::None => true,
-            _ => false,
-        }
-    }
-}
-
-impl Default for Encoder {
-    fn default() -> Self {
-        Encoder::None
-    }
-}
-
-impl std::io::Write for Encoder {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Encoder::Brotli(e) => e.write(buf),
-            Encoder::Gzip(e) => e.write(buf),
-            Encoder::Deflate(e) => e.write(buf),
-            Encoder::None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Encoder::Brotli(e) => e.flush(),
-            Encoder::Gzip(e) => e.flush(),
-            Encoder::Deflate(e) => e.flush(),
-            Encoder::None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-        }
-    }
-}
-
-pub async fn compress_file(mut file: Pin<Box<dyn SaphirFile>>, mut encoder: Encoder, compression: Compression) -> io::Result<Vec<u8>> {
-    if encoder.is_none() && compression != Compression::Raw {
-        encoder = match compression {
-            Compression::Gzip => Encoder::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::default())),
-            Compression::Deflate => Encoder::Deflate(DeflateEncoder::new(Vec::new(), flate2::Compression::default())),
-            Compression::Brotli => Encoder::Brotli(brotli::CompressorWriter::new(Vec::new(), MAX_BUFFER, 6, 22)),
-            Compression::Raw => Encoder::None,
-        }
-    } else if compression == Compression::Raw {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
-    }
-
-    loop {
-        let mut buffer = vec![0; MAX_BUFFER];
-        match file.read(buffer.as_mut_slice()).await {
-            Ok(size) => {
-                if size > 0 {
-                    encoder.write(&buffer[0..size])?;
-                } else {
-                    break;
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    match encoder {
-        Encoder::Gzip(e) => e.finish(),
-        Encoder::Deflate(e) => e.finish(),
-        Encoder::Brotli(mut e) => match e.flush() {
-            Ok(()) => Ok(e.into_inner()),
-            Err(e) => Err(e),
-        },
-        Encoder::None => Err(io::Error::from(io::ErrorKind::Interrupted)),
+        b.header(http::header::ACCEPT_RANGES, "bytes")
+            .header(http::header::CONTENT_TYPE, mime)
+            .header(http::header::CONTENT_LENGTH, len)
     }
 }
 
@@ -299,6 +163,12 @@ impl FileStream {
 
     pub fn get_size(&self) -> u64 {
         self.inner.get_size()
+    }
+}
+
+impl From<File> for FileStream {
+    fn from(other: File) -> Self {
+        FileStream::new(other)
     }
 }
 
@@ -337,8 +207,8 @@ impl Stream for FileStream {
             while self.buffer.len() < MAX_BUFFER && !self.end_of_file {
                 match self.inner.as_mut().poll_read(cx, &mut buffer) {
                     Poll::Ready(Ok(s)) => {
-                        if dbg!(s) > 0 {
-                            self.buffer.extend_from_slice(dbg!(&buffer[0..s]));
+                        if s > 0 {
+                            self.buffer.extend_from_slice(&buffer[0..s]);
                         }
                         self.end_of_file = s == 0;
                     }
